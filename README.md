@@ -49,11 +49,42 @@ epicure steer --from italian --to japanese salmon garlic
 # Most similar ingredients (cultural substitutes by default)
 epicure similar miso
 
-# Generate a recipe (Ollama must be running)
+# Generate a recipe with suggested additions (Ollama must be running)
 epicure recipe beef onion tomato
 
-# Use a specific Ollama model
-epicure recipe --model llama3.2 chicken garlic
+# Cook from exactly what you have — no shopping
+epicure fridge chicken lemon garlic spinach
+```
+
+## Fridge mode
+
+`fridge` is the primary cooking command: give it everything in your fridge and it makes a recipe from only those ingredients, without requiring you to buy anything.
+
+```bash
+epicure fridge chicken lemon garlic spinach
+epicure fridge salmon miso scallion ginger --serves 2
+epicure fridge beef onion tomato potato --time 30
+epicure fridge tofu broccoli soy_sauce ginger sesame_oil --vegan
+```
+
+`recipe` works similarly but also suggests additions from flavor pairings, so it's better when you're willing to grab one or two extra things.
+
+## Constraints
+
+Both `recipe` and `fridge` accept:
+
+| Flag | Effect |
+|------|--------|
+| `--serves N` | Target number of servings |
+| `--time N` | Maximum cook time in minutes |
+| `--vegan` | No meat, fish, dairy, or eggs |
+| `--vegetarian` | No meat or fish |
+| `--gluten-free` | Gluten-free |
+| `--dairy-free` | No milk, cream, butter, or cheese |
+
+```bash
+epicure fridge chicken broccoli garlic --serves 4 --time 20 --gluten-free
+epicure recipe salmon lemon butter --serves 2 --dairy-free
 ```
 
 ## Embedding variants
