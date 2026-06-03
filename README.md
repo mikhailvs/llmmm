@@ -64,12 +64,19 @@ epicure fridge chicken lemon garlic spinach
 
 ```bash
 epicure fridge chicken lemon garlic spinach
-epicure fridge salmon miso scallion ginger --serves 2
-epicure fridge beef onion tomato potato --time 30
+epicure fridge salmon rice nori cucumber --cuisine russian
+epicure fridge beef onion tomato potato --time 30 --cuisine mexican
 epicure fridge tofu broccoli soy_sauce ginger sesame_oil --vegan
 ```
 
 `recipe` works similarly but also suggests additions from flavor pairings, so it's better when you're willing to grab one or two extra things.
+
+```bash
+epicure recipe salmon rice nori --cuisine russian
+epicure recipe chicken thighs --cuisine peruvian --serves 4
+```
+
+`--cuisine` accepts any cuisine name. Built-in ones are instant; anything else is generated via the local LLM.
 
 ## Constraints
 

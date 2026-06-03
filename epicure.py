@@ -133,7 +133,7 @@ def _get_model():
     return os.environ.get("EPICURE_MODEL", "qwen3:8b")
 
 
-def _ollama_call(prompt, max_tokens=256):
+def _ollama_call(prompt, max_tokens=256, timeout=90):
     """Single non-streaming Ollama call. Returns text or None if unreachable."""
     import urllib.request, json as _json
     payload = _json.dumps({
@@ -148,7 +148,7 @@ def _ollama_call(prompt, max_tokens=256):
             "http://localhost:11434/api/chat", data=payload,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return _json.loads(r.read()).get("message", {}).get("content", "").strip()
     except OSError:
         return None
@@ -404,6 +404,22 @@ CUISINE_MARKERS = {
                        "garlic", "rice_vinegar", "sesame_seed", "doenjang"],
     "middle_eastern": ["cumin", "coriander", "turmeric", "sumac", "za_atar",
                        "tahini", "pomegranate_molasses", "chickpea", "lemon"],
+    "russian":        ["potato", "beet", "cabbage", "dill", "sour_cream",
+                       "buckwheat", "mushroom", "onion", "carrot", "black_pepper"],
+    "greek":          ["olive_oil", "lemon", "oregano", "feta_cheese", "garlic",
+                       "tomato", "eggplant", "lamb", "yogurt", "cucumber"],
+    "spanish":        ["olive_oil", "paprika", "saffron", "garlic", "tomato",
+                       "chorizo", "sherry_vinegar", "almond", "onion", "bell_pepper"],
+    "vietnamese":     ["fish_sauce", "lemongrass", "lime", "rice_noodle", "mint",
+                       "coriander", "chili_pepper", "ginger", "shrimp", "bean_sprout"],
+    "moroccan":       ["cumin", "coriander", "cinnamon", "ginger", "turmeric",
+                       "preserved_lemon", "olive", "chickpea", "harissa", "ras_el_hanout"],
+    "american":       ["butter", "flour", "corn", "black_pepper", "garlic",
+                       "onion", "cheddar_cheese", "bacon", "hot_sauce", "barbecue_sauce"],
+    "brazilian":      ["lime", "garlic", "onion", "black_bean", "rice",
+                       "chili_pepper", "coconut_milk", "palm_oil", "coriander", "cumin"],
+    "peruvian":       ["potato", "corn", "lime", "chili_pepper", "coriander",
+                       "garlic", "onion", "cumin", "aji_amarillo", "avocado"],
 }
 
 
@@ -758,17 +774,36 @@ def _dietary_note(args):
     return constraints, args
 
 
+def _steer_queries(indices, cooc, chem, core, names, cuisine=None):
+    """Return (qcooc, qchem, qcore, style_note) with optional cuisine steering in cooc space."""
+    qchem = idf_centroid(indices, chem, names)
+    qcore = idf_centroid(indices, core, names)
+    if cuisine:
+        cvec, err = cuisine_vector(cuisine, names, cooc)
+        if err:
+            print(f"  Note: {err}", file=sys.stderr)
+            qcooc = idf_centroid(indices, cooc, names)
+            style_note = ""
+        else:
+            base = idf_centroid(indices, cooc, names)
+            qcooc = slerp(base, cvec, 0.5)
+            style_note = f"The dish should have a {cuisine} character and flavour profile. "
+    else:
+        qcooc = idf_centroid(indices, cooc, names)
+        style_note = ""
+    return qcooc, qchem, qcore, style_note
+
+
 def cmd_recipe(args, quiet=False):
     """Generate a recipe via local Ollama.
 
+    --cuisine <name>    steer pairings toward a cuisine style
     --model <name>      Ollama model (default: $EPICURE_MODEL or qwen3:8b)
     --serves <N>        target number of servings
     --time <N>          maximum cook time in minutes
-    --vegan             dietary constraint
-    --vegetarian        dietary constraint
-    --gluten-free       dietary constraint
-    --dairy-free        dietary constraint
+    --vegan / --vegetarian / --gluten-free / --dairy-free
     """
+    cuisine,    args = pop_option(args, "--cuisine")
     model_arg,  args = pop_option(args, "--model")
     serves,     args = pop_option(args, "--serves")
     max_time,   args = pop_option(args, "--time")
@@ -778,8 +813,8 @@ def cmd_recipe(args, quiet=False):
     MODEL = model_arg or os.environ.get("EPICURE_MODEL", "qwen3:8b")
 
     if not args:
-        print("Usage: epicure recipe [--model M] [--serves N] [--time N] "
-              "[--vegan] [--gluten-free] [--dairy-free] <ingredient> ...", file=sys.stderr)
+        print("Usage: epicure recipe [--cuisine C] [--serves N] [--time N] "
+              "[--vegan] [--gluten-free] <ingredient> ...", file=sys.stderr)
         return 1
 
     if not _check_ollama(MODEL):
@@ -795,28 +830,29 @@ def cmd_recipe(args, quiet=False):
         return 1
 
     base_ingredients = [names[i] for i in indices]
-    qcooc = idf_centroid(indices, cooc, names)
-    qchem = idf_centroid(indices, chem, names)
-    qcore = idf_centroid(indices, core, names)
+    qcooc, qchem, qcore, style_note = _steer_queries(
+        indices, cooc, chem, core, names, cuisine
+    )
     complement_results = ensemble_score(
         qcooc, qchem, qcore, cooc, chem, core, names,
         ms_cooc, ms_chem, ms_core, k=8, exclude=indices
     )
     complement_names = [c[0] for c in complement_results]
 
-    print(f"\nCore: {display_list(base_ingredients)}", file=sys.stderr)
+    tag = f" → {cuisine}" if cuisine else ""
+    print(f"\nCore: {display_list(base_ingredients)}{tag}", file=sys.stderr)
     print(f"Pairings: {display_list(complement_names)}", file=sys.stderr)
     print(f"Generating with {MODEL}...\n", file=sys.stderr)
 
     serves_line  = f"**Serves:** {serves}" if serves else "**Serves:** 2–4"
     time_line    = f"**Time:** {max_time} min or less" if max_time else "**Time:** X min"
-    diet_line    = (f"Dietary requirements: {', '.join(constraints)}. " if constraints else "")
-    time_constraint = (f"The recipe must be completable in {max_time} minutes. " if max_time else "")
+    diet_line    = f"Dietary requirements: {', '.join(constraints)}. " if constraints else ""
+    time_constraint = f"The recipe must be completable in {max_time} minutes. " if max_time else ""
 
     prompt = (
         f"You are a skilled chef. I have these ingredients: {display_list(base_ingredients)}.\n"
         f"Based on flavor science, these pair especially well with them: {display_list(complement_names)}.\n\n"
-        f"{diet_line}{time_constraint}"
+        f"{style_note}{diet_line}{time_constraint}"
         f"Create one delicious, practical recipe using the core ingredients and at least 3 of the "
         f"suggested additions. Format it as:\n"
         f"# [Recipe Name]\n\n"
@@ -834,11 +870,13 @@ def cmd_fridge(args, quiet=False):
     Unlike 'recipe', this command frames the ingredients as your full
     available pantry and tells the LLM not to require anything else.
 
+    --cuisine <name>    give the dish a specific style (e.g. russian, thai)
     --model <name>      Ollama model
     --serves <N>        target servings
     --time <N>          max cook time in minutes
     --vegan / --vegetarian / --gluten-free / --dairy-free
     """
+    cuisine,    args = pop_option(args, "--cuisine")
     model_arg,  args = pop_option(args, "--model")
     serves,     args = pop_option(args, "--serves")
     max_time,   args = pop_option(args, "--time")
@@ -867,20 +905,12 @@ def cmd_fridge(args, quiet=False):
 
     have = [names[i] for i in indices]
 
-    # Find which of their ingredients pair best together (to guide the LLM)
-    qcooc = idf_centroid(indices, cooc, names)
-    qchem = idf_centroid(indices, chem, names)
-    qcore = idf_centroid(indices, core, names)
-    pair_results = ensemble_score(
-        qcooc, qchem, qcore, cooc, chem, core, names,
-        ms_cooc, ms_chem, ms_core, k=5, exclude=indices
+    qcooc, qchem, qcore, style_note = _steer_queries(
+        indices, cooc, chem, core, names, cuisine
     )
-    # Only keep pairings that are also in the user's ingredient list
-    have_set = set(have)
-    good_combos = [display(have[i]) for i in range(len(have))
-                   if any(r[0] in have_set for r in pair_results)]
 
-    print(f"\nFridge: {display_list(have)}", file=sys.stderr)
+    tag = f" → {cuisine}" if cuisine else ""
+    print(f"\nFridge: {display_list(have)}{tag}", file=sys.stderr)
     print(f"Generating with {MODEL}...\n", file=sys.stderr)
 
     serves_line  = f"**Serves:** {serves}" if serves else "**Serves:** 2–4"
@@ -894,7 +924,7 @@ def cmd_fridge(args, quiet=False):
         f"They cannot go shopping. Build the entire recipe from this list only — "
         f"you may assume they have basic pantry staples (salt, pepper, oil, water) "
         f"but nothing else.\n\n"
-        f"{diet_line}{time_constraint}"
+        f"{style_note}{diet_line}{time_constraint}"
         f"Create the best possible recipe from these ingredients. Format it as:\n"
         f"# [Recipe Name]\n\n"
         f"{serves_line}\n{time_line}\n\n"
@@ -989,8 +1019,8 @@ Commands:
   steer    <cuisine> <ingredients…>      push ingredients toward a cuisine style
   steer    --from <c1> --to <c2> <ingr>  relative direction between two cuisines
   surprise <ingredients…>               surprising: good chemistry, rarely combined
-  fridge   <ingredients…>               make dinner from exactly what you have
-  recipe   <ingredients…>               generate a recipe (suggests additions)
+  fridge   [--cuisine C] <ingredients…>  make dinner from exactly what you have
+  recipe   [--cuisine C] <ingredients…>  generate a recipe (suggests additions)
 
 Variants (--variant):
   cooc      cultural co-occurrence (default for similar, steer)
@@ -1002,6 +1032,7 @@ Cuisines: italian · mexican · japanese · indian · chinese · thai
           french · mediterranean · korean · middle_eastern
 
 Recipe / fridge flags:
+  --cuisine <name>    steer the dish toward a cuisine style (any cuisine — uses LLM if unknown)
   --serves <N>        target number of servings
   --time <N>          max cook time in minutes
   --vegan             dietary constraint
