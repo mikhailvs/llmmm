@@ -96,9 +96,19 @@ def resolve(name, names):
     key = normalize(name)
     if key in names:
         return [key]
+    # Try singular (strip trailing 's' or 'es')
+    for stem in [key.rstrip("s"), key[:-2] if key.endswith("es") else key]:
+        if stem and stem in names:
+            return [stem]
     matches = [n for n in names if key in n or n.startswith(key)]
     if matches:
         return matches
+    # Also try stem-based prefix match
+    stem = key.rstrip("s")
+    if stem != key:
+        matches = [n for n in names if n.startswith(stem)]
+        if matches:
+            return matches
     words = set(key.split("_"))
     scored = [(len(words & set(n.split("_"))), n) for n in names]
     best = max(s for s, _ in scored)
@@ -108,8 +118,6 @@ def resolve(name, names):
 
 
 def fuzzy_suggest(key, names, vecs, n=3):
-    """Use embedding similarity to suggest near-misses for unknown ingredients."""
-    # Simple character-overlap heuristic (no embedding needed since we can't look it up)
     key_chars = set(key)
     scored = [(len(key_chars & set(n)) / max(len(key_chars | set(n)), 1), n)
               for n in names if abs(len(n) - len(key)) <= 4]
@@ -117,16 +125,121 @@ def fuzzy_suggest(key, names, vecs, n=3):
     return [n for _, n in scored[:n]]
 
 
+# ---------------------------------------------------------------------------
+# Ollama helpers (used for LLM-assisted normalization and cuisine generation)
+# ---------------------------------------------------------------------------
+
+def _get_model():
+    return os.environ.get("EPICURE_MODEL", "qwen3:8b")
+
+
+def _ollama_call(prompt, max_tokens=256):
+    """Single non-streaming Ollama call. Returns text or None if unreachable."""
+    import urllib.request, json as _json
+    payload = _json.dumps({
+        "model": _get_model(),
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "think": False,
+        "options": {"num_predict": max_tokens},
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            "http://localhost:11434/api/chat", data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return _json.loads(r.read()).get("message", {}).get("content", "").strip()
+    except OSError:
+        return None
+
+
+_LLM_CUISINE_CACHE: dict = {}
+
+
+def llm_cuisine_markers(cuisine, names):
+    """Generate representative ingredients for any cuisine via the local LLM.
+
+    Asks the LLM to freely name typical ingredients (no vocabulary constraint),
+    then maps each response to the nearest known vocabulary entry. This keeps
+    the prompt small and lets the model answer from its own knowledge.
+    Result is cached in memory for the session.
+    """
+    if cuisine in _LLM_CUISINE_CACHE:
+        return _LLM_CUISINE_CACHE[cuisine]
+
+    prompt = (
+        f"List 15 simple ingredients most commonly used in {cuisine} cuisine. "
+        f"Basic ingredient names only — no dish names, no preparations. "
+        f"Reply with a JSON array and nothing else. "
+        f'Example: ["cumin", "lime", "chili pepper", "avocado"]'
+    )
+    response = _ollama_call(prompt, max_tokens=200)
+    if not response:
+        return None
+
+    import json as _json, re as _re
+    m = _re.search(r'\[.*?\]', response, _re.DOTALL)
+    if not m:
+        return None
+    try:
+        items = _json.loads(m.group())
+    except _json.JSONDecodeError:
+        return None
+
+    # Map each LLM-named ingredient to the vocabulary using normal resolution
+    valid, seen = [], set()
+    for item in items:
+        for candidate in resolve(str(item), names):
+            if candidate not in seen:
+                valid.append(candidate)
+                seen.add(candidate)
+                break
+
+    result = valid[:12] if len(valid) >= 3 else None
+    if result:
+        _LLM_CUISINE_CACHE[cuisine] = result
+    return result
+
+
+def llm_normalize_ingredient(name, names):
+    """Map an unknown ingredient to the nearest vocabulary entry via the local LLM.
+
+    Asks the LLM what the ingredient is most similar to (freely, from its own
+    knowledge), then resolves that answer against the vocabulary.
+    """
+    prompt = (
+        f"What is the single most culinarily similar common ingredient to '{name}'? "
+        f"Reply with only a simple ingredient name — no explanation."
+    )
+    response = _ollama_call(prompt)
+    if not response:
+        return None
+    # Take the first line, strip punctuation
+    answer = response.strip().split("\n")[0].strip().strip('"\'.,')
+    key = normalize(answer)
+    if key in names:
+        return key
+    candidates = resolve(answer, names)
+    return candidates[0] if candidates else None
+
+
 def resolve_one(name, names, vecs=None, quiet=False):
     candidates = resolve(name, names)
     if not candidates:
         if not quiet:
+            # Try LLM normalization before giving up
+            print(f"  '{display(normalize(name))}' not in vocabulary — asking model...",
+                  end=" ", flush=True, file=sys.stderr)
+            mapped = llm_normalize_ingredient(name, names)
+            if mapped:
+                print(f"→ '{display(mapped)}'", file=sys.stderr)
+                return mapped
+            # LLM unavailable or no match — fall back to fuzzy suggestions
             suggestions = fuzzy_suggest(normalize(name), names, vecs) if vecs is not None else []
-            msg = f"  '{display(normalize(name))}' not found"
+            msg = "no match found"
             if suggestions:
-                msg += f" — did you mean: {display_list(suggestions[:3])}?"
-            else:
-                msg += " — try: epicure search <term>"
+                msg += f" — closest in vocabulary: {display_list(suggestions[:3])}"
             print(msg, file=sys.stderr)
         return None
     if candidates[0] == normalize(name):
@@ -295,20 +408,37 @@ CUISINE_MARKERS = {
 
 
 def cuisine_vector(cuisine, names, vecs):
-    """Return a discriminative cuisine pole with the global mean subtracted."""
-    markers = CUISINE_MARKERS.get(cuisine.lower())
+    """Return a discriminative cuisine pole with the global mean subtracted.
+
+    Falls back to LLM-generated markers for any cuisine not in CUISINE_MARKERS.
+    """
+    key = cuisine.lower()
+    markers = CUISINE_MARKERS.get(key)
+
     if markers is None:
-        return None, f"Unknown cuisine '{cuisine}'. Choose from: {', '.join(CUISINE_MARKERS)}"
+        # Unknown cuisine — ask the local LLM to generate markers
+        print(f"  '{cuisine}' not in built-in list — generating markers via model...",
+              end=" ", flush=True, file=sys.stderr)
+        markers = llm_cuisine_markers(key, names)
+        if not markers:
+            print("failed", file=sys.stderr)
+            return None, (
+                f"Unknown cuisine '{cuisine}' and could not generate markers. "
+                f"Is Ollama running? (ollama serve)\n"
+                f"Built-in cuisines: {', '.join(CUISINE_MARKERS)}"
+            )
+        preview = display_list(markers[:5]) + ("…" if len(markers) > 5 else "")
+        print(f"→ {preview}", file=sys.stderr)
+
     indices = [names.index(m) for m in markers if m in names]
     if not indices:
         return None, f"No markers for '{cuisine}' found in vocabulary."
-    # Subtract global corpus mean to isolate cuisine-specific direction
     global_mean = vecs.mean(axis=0)
     marker_vecs = vecs[indices] - global_mean
     v = marker_vecs.mean(axis=0)
     norm = np.linalg.norm(v)
     if norm < 1e-8:
-        return None, f"Cuisine pole for '{cuisine}' collapsed to zero after mean subtraction."
+        return None, f"Cuisine pole for '{cuisine}' collapsed after mean subtraction."
     return v / norm, None
 
 

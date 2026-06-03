@@ -1,5 +1,7 @@
 # epicure
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Offline ingredient pairing and recipe generation, powered by food embeddings from the [Epicure paper](https://arxiv.org/abs/2605.22391).
 
 Three embedding spaces encode complementary knowledge learned from 4.1 million recipes: cultural co-occurrence (`cooc`), molecular flavor compatibility (`chem`), and cross-lingual core structure (`core`). The tool finds ingredient pairings, steers toward cuisine styles, surfaces surprising creative pairings, and generates recipes with a local LLM via Ollama — no internet required after setup.
@@ -130,7 +132,26 @@ epicure -q pair salmon miso | epicure -q recipe
 
 ## Cuisines
 
+Ten cuisines are built in:
+
 `italian` · `mexican` · `japanese` · `indian` · `chinese` · `thai` · `french` · `mediterranean` · `korean` · `middle_eastern`
+
+Any other cuisine name is handled automatically — the local LLM generates representative ingredients from the vocabulary on the fly:
+
+```bash
+epicure steer peruvian chicken potato
+epicure steer georgian lamb walnut
+epicure steer ethiopian lentil onion
+```
+
+Similarly, ingredients not in the 1,790-item vocabulary are mapped to the nearest known entry via the LLM:
+
+```bash
+epicure pair ramps garlic          # 'ramps' → resolved via model
+epicure fridge celtuce miso ginger # 'celtuce' → resolved via model
+```
+
+Both results are cached for the session so subsequent calls are instant.
 
 ## How it works
 
