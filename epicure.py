@@ -59,18 +59,17 @@ def load_embeddings(variant="cooc"):
         raise ValueError(f"Unknown embedding variant '{variant}'. Choose: cooc, chem, core")
     names, vecs = _load_one(path)
     mean_sim = (vecs @ vecs.T).mean(axis=1)
-    global_mean = vecs.mean(axis=0)          # cached here so cuisine_vector doesn't recompute
-    _CACHE[variant] = (names, vecs, mean_sim, global_mean)
+    _CACHE[variant] = (names, vecs, mean_sim)
     if not _NAME_IDX:                        # all variants share the same ingredient order
         _NAME_IDX.update({n: i for i, n in enumerate(names)})
-    return names, vecs, mean_sim, global_mean
+    return names, vecs, mean_sim
 
 
 def load_all_embeddings():
     """Load all three variants, return (names, cooc, chem, core, ms_cooc, ms_chem, ms_core)."""
-    names, cooc, ms_cooc, _gm = load_embeddings("cooc")
-    _n,   chem, ms_chem, _gm = load_embeddings("chem")
-    _n,   core, ms_core, _gm = load_embeddings("core")
+    names, cooc, ms_cooc = load_embeddings("cooc")
+    _n,   chem, ms_chem = load_embeddings("chem")
+    _n,   core, ms_core = load_embeddings("core")
     return names, cooc, chem, core, ms_cooc, ms_chem, ms_core
 
 
@@ -460,8 +459,9 @@ def cuisine_vector(cuisine, names, vecs, quiet=False):
     indices = [_NAME_IDX[m] for m in markers if m in _NAME_IDX]
     if not indices:
         return None, f"No markers for '{cuisine}' found in vocabulary."
-    # Use cached global mean (computed once at load time) rather than recomputing
-    _, _, _, global_mean = _CACHE.get("cooc") or load_embeddings("cooc")
+    # Global mean must come from the SAME embedding space as `vecs` (cooc vs core),
+    # so derive it from the passed array. At 1790x300 this is ~50us — negligible.
+    global_mean = vecs.mean(axis=0)
     marker_vecs = vecs[indices] - global_mean
     v = marker_vecs.mean(axis=0)
     norm = np.linalg.norm(v)
@@ -484,10 +484,6 @@ def surprise_scores(query_indices, cooc, chem, names, ms_cooc, ms_chem, k=12, ex
 
     s_cooc = cooc @ qvec_cooc - ms_cooc
     s_chem = chem @ qvec_chem - ms_chem
-
-    def znorm(s):
-        mu, sd = s.mean(), s.std()
-        return (s - mu) / (sd + 1e-8)
 
     gap = _znorm(s_chem) - _znorm(s_cooc)
 
@@ -599,7 +595,7 @@ def cmd_pair(args, quiet=False):
                 print(f"Unknown variant '{v}'. Choose: cooc, chem, core, ensemble", file=sys.stderr)
                 return 1
             loading_msg("Loading embeddings...", quiet)
-            names, vecs, mean_sim, _gm = load_embeddings(v)
+            names, vecs, mean_sim = load_embeddings(v)
             loading_done(f"({len(names)} ingredients)", quiet)
             indices = [names.index(n) for a in args if (n := resolve_one(a, names, vecs))]
             if not indices:
@@ -639,7 +635,7 @@ def cmd_similar(args, quiet=False):
         return 1
 
     loading_msg("Loading embeddings...", quiet)
-    names, vecs, mean_sim, _gm = load_embeddings(v)
+    names, vecs, mean_sim = load_embeddings(v)
     loading_done(f"({len(names)} ingredients)", quiet)
 
     n = resolve_one(args[0], names, vecs)
@@ -684,15 +680,15 @@ def cmd_steer(args, quiet=False):
         return 1
 
     loading_msg("Loading embeddings...", quiet)
-    names, vecs, mean_sim, _gm = load_embeddings(v)
+    names, vecs, mean_sim = load_embeddings(v)
     loading_done(f"({len(names)} ingredients)", quiet)
 
     if from_cui and to_cui:
         # Analogy arithmetic: direction = to_pole - from_pole
-        pole_from, err = cuisine_vector(from_cui, names, vecs)
+        pole_from, err = cuisine_vector(from_cui, names, vecs, quiet=quiet)
         if err:
             print(err, file=sys.stderr); return 1
-        pole_to, err = cuisine_vector(to_cui, names, vecs)
+        pole_to, err = cuisine_vector(to_cui, names, vecs, quiet=quiet)
         if err:
             print(err, file=sys.stderr); return 1
         direction = pole_to - pole_from
@@ -710,7 +706,7 @@ def cmd_steer(args, quiet=False):
             return 1
         cuisine_label    = all_args[0]
         ingredient_args  = all_args[1:]
-        direction, err = cuisine_vector(cuisine_label, names, vecs)
+        direction, err = cuisine_vector(cuisine_label, names, vecs, quiet=quiet)
         if err:
             print(err, file=sys.stderr); return 1
 
@@ -959,7 +955,7 @@ def cmd_search(args, quiet=False):
         return 1
     term = normalize(args[0])
     # load just cooc names (fast, no vecs needed for search)
-    names, _vecs, _ms, _gm = load_embeddings("cooc")
+    names, _vecs, _ms = load_embeddings("cooc")
     matches = [n for n in names if term in n]
     if matches:
         if not PIPE_OUT:
@@ -1089,7 +1085,7 @@ def main():
     if cmd not in COMMANDS:
         # Suggest search on unknown command (might be an ingredient name)
         try:
-            names, _vecs, _ms, _gm = load_embeddings("cooc")
+            names, _vecs, _ms = load_embeddings("cooc")
             suggestions = fuzzy_suggest(normalize(cmd), names, _vecs, n=3)
             msg = f"Unknown command '{cmd}'."
             if suggestions:
