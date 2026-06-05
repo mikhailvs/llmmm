@@ -9,14 +9,34 @@ output plain names when stdout is not a terminal, so commands chain:
   epicure pair chicken garlic lemon | epicure recipe
 """
 
-import sys, os, csv, re
+import sys, os, csv, re, stat
 import numpy as np
 
 DATA_DIR     = os.path.join(os.path.dirname(__file__), "data")
 FILE_COOC    = os.path.join(DATA_DIR, "epicure_cooc.csv")
 FILE_CHEM    = os.path.join(DATA_DIR, "epicure_chem.csv")
 FILE_CORE    = os.path.join(DATA_DIR, "epicure_core.csv")
-PIPE_IN      = not sys.stdin.isatty()
+
+
+def _stdin_is_readable_pipe():
+    """True only when stdin is a pipe or regular file.
+
+    These reliably deliver EOF, so a blocking read() terminates (which is
+    required for pipe chains like `epicure pair X | epicure recipe`, where we
+    must wait for the upstream to finish and close). Ttys, sockets, and char
+    devices are excluded: a socket stdin (some sandboxes/orchestrators) never
+    sends EOF and would hang read() forever.
+    """
+    if sys.stdin.isatty():
+        return False
+    try:
+        mode = os.fstat(sys.stdin.fileno()).st_mode
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
+
+
+PIPE_IN      = _stdin_is_readable_pipe()
 PIPE_OUT     = not sys.stdout.isatty()
 
 
