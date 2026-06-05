@@ -48,26 +48,30 @@ def _load_one(path):
 
 
 _CACHE = {}
+_NAME_IDX: dict = {}   # name → index, shared across variants (same ingredient order)
+
 
 def load_embeddings(variant="cooc"):
     if variant in _CACHE:
         return _CACHE[variant]
-    path = {"cooc": FILE_COOC, "chem": FILE_CHEM, "core": FILE_CORE}[variant]
+    path = {"cooc": FILE_COOC, "chem": FILE_CHEM, "core": FILE_CORE}.get(variant)
+    if path is None:
+        raise ValueError(f"Unknown embedding variant '{variant}'. Choose: cooc, chem, core")
     names, vecs = _load_one(path)
-    # Precompute per-ingredient mean similarity for hubness correction
-    # mean_sim[i] = average cosine similarity of ingredient i to all others
     mean_sim = (vecs @ vecs.T).mean(axis=1)
-    _CACHE[variant] = (names, vecs, mean_sim)
-    return names, vecs, mean_sim
+    global_mean = vecs.mean(axis=0)          # cached here so cuisine_vector doesn't recompute
+    _CACHE[variant] = (names, vecs, mean_sim, global_mean)
+    if not _NAME_IDX:                        # all variants share the same ingredient order
+        _NAME_IDX.update({n: i for i, n in enumerate(names)})
+    return names, vecs, mean_sim, global_mean
 
 
 def load_all_embeddings():
-    """Load all three variants, return (names, cooc_vecs, chem_vecs, core_vecs, mean_sims)."""
-    names_c, cooc, ms_cooc = load_embeddings("cooc")
-    names_h, chem, ms_chem = load_embeddings("chem")
-    names_r, core, ms_core = load_embeddings("core")
-    # All three files share the same ingredient list in the same order
-    return names_c, cooc, chem, core, ms_cooc, ms_chem, ms_core
+    """Load all three variants, return (names, cooc, chem, core, ms_cooc, ms_chem, ms_core)."""
+    names, cooc, ms_cooc, _gm = load_embeddings("cooc")
+    _n,   chem, ms_chem, _gm = load_embeddings("chem")
+    _n,   core, ms_core, _gm = load_embeddings("core")
+    return names, cooc, chem, core, ms_cooc, ms_chem, ms_core
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +154,7 @@ def _ollama_call(prompt, max_tokens=256, timeout=90):
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return _json.loads(r.read()).get("message", {}).get("content", "").strip()
-    except OSError:
+    except (OSError, ValueError):   # OSError: network; ValueError: json.JSONDecodeError
         return None
 
 
@@ -179,13 +183,19 @@ def llm_cuisine_markers(cuisine, names):
         return None
 
     import json as _json, re as _re
-    m = _re.search(r'\[.*?\]', response, _re.DOTALL)
-    if not m:
-        return None
+    # Try direct parse first (prompt asks for JSON only); fall back to extraction
     try:
-        items = _json.loads(m.group())
-    except _json.JSONDecodeError:
-        return None
+        items = _json.loads(response.strip())
+        if not isinstance(items, list):
+            raise ValueError
+    except (ValueError, _json.JSONDecodeError):
+        m = _re.search(r'\[.*\]', response, _re.DOTALL)  # greedy: outermost array
+        if not m:
+            return None
+        try:
+            items = _json.loads(m.group())
+        except _json.JSONDecodeError:
+            return None
 
     # Map each LLM-named ingredient to the vocabulary using normal resolution
     valid, seen = [], set()
@@ -227,15 +237,16 @@ def llm_normalize_ingredient(name, names):
 def resolve_one(name, names, vecs=None, quiet=False):
     candidates = resolve(name, names)
     if not candidates:
+        # Always attempt LLM normalization — quiet only suppresses printing
         if not quiet:
-            # Try LLM normalization before giving up
             print(f"  '{display(normalize(name))}' not in vocabulary — asking model...",
                   end=" ", flush=True, file=sys.stderr)
-            mapped = llm_normalize_ingredient(name, names)
-            if mapped:
+        mapped = llm_normalize_ingredient(name, names)
+        if mapped:
+            if not quiet:
                 print(f"→ '{display(mapped)}'", file=sys.stderr)
-                return mapped
-            # LLM unavailable or no match — fall back to fuzzy suggestions
+            return mapped
+        if not quiet:
             suggestions = fuzzy_suggest(normalize(name), names, vecs) if vecs is not None else []
             msg = "no match found"
             if suggestions:
@@ -254,11 +265,9 @@ def resolve_one(name, names, vecs=None, quiet=False):
 # ---------------------------------------------------------------------------
 
 def idf_centroid(indices, vecs, names_list):
-    """IDF-weighted centroid: weight each ingredient vector by log(N / df).
-    df is approximated by name length as a proxy for specificity; for a true
-    IDF we use the document frequency implied by co-occurrence rank (index+1).
-    In practice we weight by log(N / (rank+1)) where rank is the vocab index,
-    since the CSV is ordered by frequency in the source corpus."""
+    """IDF-weighted centroid: weight each ingredient vector by log(N / df)."""
+    if not indices:
+        return np.zeros(vecs.shape[1], dtype=np.float32)
     N = len(names_list)
     weights = np.array([np.log(N / (idx + 1)) for idx in indices], dtype=np.float32)
     weights = np.maximum(weights, 0.1)
@@ -301,7 +310,7 @@ def mmr(query_vec, vecs, names, k=12, exclude=None, mean_sim=None, lam=0.6):
     if s_max > s_min:
         cand_scores = (cand_scores - s_min) / (s_max - s_min)
 
-    name_to_idx = {n: names.index(n) for n in cand_names}
+    name_to_idx = {n: _NAME_IDX[n] for n in cand_names}  # O(1) via precomputed index
     selected = []
     selected_vecs = []
 
@@ -343,6 +352,11 @@ def slerp(v0, v1, t):
     return v0 * np.cos(theta) + perp * np.sin(theta)
 
 
+def _znorm(s):
+    mu, sd = s.mean(), s.std()
+    return (s - mu) / (sd + 1e-8)
+
+
 def ensemble_score(query_vec_cooc, query_vec_chem, query_vec_core,
                    cooc, chem, core, names,
                    ms_cooc, ms_chem, ms_core,
@@ -359,12 +373,7 @@ def ensemble_score(query_vec_cooc, query_vec_chem, query_vec_core,
     s_chem = adjusted(chem, query_vec_chem, ms_chem)
     s_core = adjusted(core, query_vec_core, ms_core)
 
-    # Z-normalise each before combining so different scales don't dominate
-    def znorm(s):
-        mu, sd = s.mean(), s.std()
-        return (s - mu) / (sd + 1e-8)
-
-    combined = w_cooc * znorm(s_cooc) + w_chem * znorm(s_chem) + w_core * znorm(s_core)
+    combined = w_cooc * _znorm(s_cooc) + w_chem * _znorm(s_chem) + w_core * _znorm(s_core)
 
     if exclude:
         for i in exclude:
@@ -423,7 +432,7 @@ CUISINE_MARKERS = {
 }
 
 
-def cuisine_vector(cuisine, names, vecs):
+def cuisine_vector(cuisine, names, vecs, quiet=False):
     """Return a discriminative cuisine pole with the global mean subtracted.
 
     Falls back to LLM-generated markers for any cuisine not in CUISINE_MARKERS.
@@ -432,24 +441,27 @@ def cuisine_vector(cuisine, names, vecs):
     markers = CUISINE_MARKERS.get(key)
 
     if markers is None:
-        # Unknown cuisine — ask the local LLM to generate markers
-        print(f"  '{cuisine}' not in built-in list — generating markers via model...",
-              end=" ", flush=True, file=sys.stderr)
+        if not quiet:
+            print(f"  '{cuisine}' not in built-in list — generating markers via model...",
+                  end=" ", flush=True, file=sys.stderr)
         markers = llm_cuisine_markers(key, names)
         if not markers:
-            print("failed", file=sys.stderr)
+            if not quiet:
+                print("failed", file=sys.stderr)
             return None, (
                 f"Unknown cuisine '{cuisine}' and could not generate markers. "
                 f"Is Ollama running? (ollama serve)\n"
                 f"Built-in cuisines: {', '.join(CUISINE_MARKERS)}"
             )
-        preview = display_list(markers[:5]) + ("…" if len(markers) > 5 else "")
-        print(f"→ {preview}", file=sys.stderr)
+        if not quiet:
+            preview = display_list(markers[:5]) + ("…" if len(markers) > 5 else "")
+            print(f"→ {preview}", file=sys.stderr)
 
-    indices = [names.index(m) for m in markers if m in names]
+    indices = [_NAME_IDX[m] for m in markers if m in _NAME_IDX]
     if not indices:
         return None, f"No markers for '{cuisine}' found in vocabulary."
-    global_mean = vecs.mean(axis=0)
+    # Use cached global mean (computed once at load time) rather than recomputing
+    _, _, _, global_mean = _CACHE.get("cooc") or load_embeddings("cooc")
     marker_vecs = vecs[indices] - global_mean
     v = marker_vecs.mean(axis=0)
     norm = np.linalg.norm(v)
@@ -467,8 +479,6 @@ def surprise_scores(query_indices, cooc, chem, names, ms_cooc, ms_chem, k=12, ex
 
     Computes chem_z - cooc_z: high score = good chemistry, unusual co-occurrence.
     """
-    from numpy import array, argsort
-
     qvec_cooc = idf_centroid(query_indices, cooc, names)
     qvec_chem = idf_centroid(query_indices, chem, names)
 
@@ -479,13 +489,13 @@ def surprise_scores(query_indices, cooc, chem, names, ms_cooc, ms_chem, k=12, ex
         mu, sd = s.mean(), s.std()
         return (s - mu) / (sd + 1e-8)
 
-    gap = znorm(s_chem) - znorm(s_cooc)
+    gap = _znorm(s_chem) - _znorm(s_cooc)
 
     if exclude:
         for i in exclude:
             gap[i] = -np.inf
 
-    order = argsort(-gap)
+    order = np.argsort(-gap)
     results = []
     for i in order:
         if len(results) == k:
@@ -507,14 +517,22 @@ def pop_flag(args, flag):
 
 
 def pop_option(args, flag):
-    """Remove --flag VALUE from args and return (value_or_None, remaining_args)."""
+    """Remove --flag VALUE from args and return (value_or_None, remaining_args).
+
+    If the flag appears more than once, only the first value is used and all
+    subsequent occurrences are stripped so they don't become spurious ingredients.
+    """
     try:
         i = args.index(flag)
         val = args[i + 1]
         args = args[:i] + args[i + 2:]
-        return val, args
     except (ValueError, IndexError):
         return None, args
+    # Strip any additional occurrences of this flag (and their values)
+    while flag in args:
+        j = args.index(flag)
+        args = args[:j] + args[j + 2:] if j + 1 < len(args) else args[:j]
+    return val, args
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +599,7 @@ def cmd_pair(args, quiet=False):
                 print(f"Unknown variant '{v}'. Choose: cooc, chem, core, ensemble", file=sys.stderr)
                 return 1
             loading_msg("Loading embeddings...", quiet)
-            names, vecs, mean_sim = load_embeddings(v)
+            names, vecs, mean_sim, _gm = load_embeddings(v)
             loading_done(f"({len(names)} ingredients)", quiet)
             indices = [names.index(n) for a in args if (n := resolve_one(a, names, vecs))]
             if not indices:
@@ -621,7 +639,7 @@ def cmd_similar(args, quiet=False):
         return 1
 
     loading_msg("Loading embeddings...", quiet)
-    names, vecs, mean_sim = load_embeddings(v)
+    names, vecs, mean_sim, _gm = load_embeddings(v)
     loading_done(f"({len(names)} ingredients)", quiet)
 
     n = resolve_one(args[0], names, vecs)
@@ -666,7 +684,7 @@ def cmd_steer(args, quiet=False):
         return 1
 
     loading_msg("Loading embeddings...", quiet)
-    names, vecs, mean_sim = load_embeddings(v)
+    names, vecs, mean_sim, _gm = load_embeddings(v)
     loading_done(f"({len(names)} ingredients)", quiet)
 
     if from_cui and to_cui:
@@ -774,24 +792,22 @@ def _dietary_note(args):
     return constraints, args
 
 
-def _steer_queries(indices, cooc, chem, core, names, cuisine=None):
-    """Return (qcooc, qchem, qcore, style_note) with optional cuisine steering in cooc space."""
+def _steer_queries(indices, cooc, chem, core, names, cuisine=None, quiet=False):
+    """Return (qcooc, qchem, qcore, style_note, cuisine_applied)."""
     qchem = idf_centroid(indices, chem, names)
     qcore = idf_centroid(indices, core, names)
     if cuisine:
-        cvec, err = cuisine_vector(cuisine, names, cooc)
+        cvec, err = cuisine_vector(cuisine, names, cooc, quiet=quiet)
         if err:
-            print(f"  Note: {err}", file=sys.stderr)
+            if not quiet:
+                print(f"  Note: {err}", file=sys.stderr)
             qcooc = idf_centroid(indices, cooc, names)
-            style_note = ""
-        else:
-            base = idf_centroid(indices, cooc, names)
-            qcooc = slerp(base, cvec, 0.5)
-            style_note = f"The dish should have a {cuisine} character and flavour profile. "
-    else:
-        qcooc = idf_centroid(indices, cooc, names)
-        style_note = ""
-    return qcooc, qchem, qcore, style_note
+            return qcooc, qchem, qcore, "", False
+        base = idf_centroid(indices, cooc, names)
+        qcooc = slerp(base, cvec, 0.5)
+        return qcooc, qchem, qcore, f"The dish should have a {cuisine} character and flavour profile. ", True
+    qcooc = idf_centroid(indices, cooc, names)
+    return qcooc, qchem, qcore, "", False
 
 
 def cmd_recipe(args, quiet=False):
@@ -830,8 +846,8 @@ def cmd_recipe(args, quiet=False):
         return 1
 
     base_ingredients = [names[i] for i in indices]
-    qcooc, qchem, qcore, style_note = _steer_queries(
-        indices, cooc, chem, core, names, cuisine
+    qcooc, qchem, qcore, style_note, cuisine_applied = _steer_queries(
+        indices, cooc, chem, core, names, cuisine, quiet=quiet
     )
     complement_results = ensemble_score(
         qcooc, qchem, qcore, cooc, chem, core, names,
@@ -839,7 +855,7 @@ def cmd_recipe(args, quiet=False):
     )
     complement_names = [c[0] for c in complement_results]
 
-    tag = f" → {cuisine}" if cuisine else ""
+    tag = f" → {cuisine}" if cuisine_applied else ""
     print(f"\nCore: {display_list(base_ingredients)}{tag}", file=sys.stderr)
     print(f"Pairings: {display_list(complement_names)}", file=sys.stderr)
     print(f"Generating with {MODEL}...\n", file=sys.stderr)
@@ -905,11 +921,11 @@ def cmd_fridge(args, quiet=False):
 
     have = [names[i] for i in indices]
 
-    qcooc, qchem, qcore, style_note = _steer_queries(
-        indices, cooc, chem, core, names, cuisine
+    qcooc, qchem, qcore, style_note, cuisine_applied = _steer_queries(
+        indices, cooc, chem, core, names, cuisine, quiet=quiet
     )
 
-    tag = f" → {cuisine}" if cuisine else ""
+    tag = f" → {cuisine}" if cuisine_applied else ""
     print(f"\nFridge: {display_list(have)}{tag}", file=sys.stderr)
     print(f"Generating with {MODEL}...\n", file=sys.stderr)
 
@@ -943,7 +959,7 @@ def cmd_search(args, quiet=False):
         return 1
     term = normalize(args[0])
     # load just cooc names (fast, no vecs needed for search)
-    names, _vecs, _ms = load_embeddings("cooc")
+    names, _vecs, _ms, _gm = load_embeddings("cooc")
     matches = [n for n in names if term in n]
     if matches:
         if not PIPE_OUT:
@@ -1073,7 +1089,7 @@ def main():
     if cmd not in COMMANDS:
         # Suggest search on unknown command (might be an ingredient name)
         try:
-            names, _vecs, _ = load_embeddings("cooc")
+            names, _vecs, _ms, _gm = load_embeddings("cooc")
             suggestions = fuzzy_suggest(normalize(cmd), names, _vecs, n=3)
             msg = f"Unknown command '{cmd}'."
             if suggestions:
